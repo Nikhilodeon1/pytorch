@@ -302,6 +302,10 @@ class MixOrderReduction:
     """
 
     @staticmethod
+    def supports_contiguous_reduction_hint(hint: ReductionHint) -> bool:
+        return hint == ReductionHint.INNER or hint.is_default_scheduling()
+
+    @staticmethod
     def _split_origins(
         node: BaseSchedulerNode,
     ) -> OrderedSet[tuple[sympy.Expr, sympy.Expr]] | None:
@@ -540,10 +544,8 @@ class MixOrderReduction:
 
         # Make sure a persistent reduction will be generated
         if any(
-            subnode.node.data.reduction_hint  # type: ignore[union-attr]
-            not in (
-                ReductionHint.INNER,
-                ReductionHint.DEFAULT,
+            not cls.supports_contiguous_reduction_hint(
+                subnode.node.data.reduction_hint  # type: ignore[union-attr]
             )
             for subnode in contiguous_node.get_nodes()
             if subnode.is_reduction()
