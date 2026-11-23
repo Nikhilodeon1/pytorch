@@ -477,7 +477,7 @@ class TestDropoutAlignRandomEager(InductorTestCase):
 instantiate_device_type_tests(
     TestDropoutAlignRandomEager,
     globals(),
-    only_for=["cuda", "xpu"],
+    except_for="cpu",
     allow_xpu=True,
 )
 
