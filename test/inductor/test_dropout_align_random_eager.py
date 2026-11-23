@@ -93,12 +93,7 @@ def _timed_run(model, x, backward: bool = False):
 
 
 def _rng_seed_and_offset(device):
-    """Return (seed, offset) from the RNG state of ``device``.
-
-    Only the 16-byte layout shared by cuda and xpu (seed[0:8] + offset[8:16])
-    is decoded here; other backends use a different size and are rejected
-    below instead of being read with the wrong field offsets.
-    """
+    """Return (seed, offset) of the cuda/xpu 16-byte RNG state."""
     st = torch.get_device_module(device).get_rng_state(device)
     if st.numel() != 16:
         raise AssertionError(f"{device} RNG state is {st.numel()} bytes, not 16")
