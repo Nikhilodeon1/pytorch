@@ -223,7 +223,7 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         dev_mod = torch.get_device_module(device)
         dtypes = [torch.float32, torch.float16, torch.bfloat16]
         for shape, dtype in itertools.product(shapes, dtypes):
-            if dtype is torch.bfloat16 and not dev_mod.is_bf16_supported():
+            if dtype is torch.bfloat16 and hasattr(dev_mod, "is_bf16_supported") and not dev_mod.is_bf16_supported():
                 continue
 
             x = torch.ones(shape, device=device, dtype=dtype)
