@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 
+import itertools
 import time
 import unittest
 
@@ -92,14 +93,15 @@ def _timed_run(model, x, backward: bool = False):
 
 
 def _rng_seed_and_offset(device):
-    """Return (seed, offset) extracted from the RNG state of ``device``.
+    """Return (seed, offset) from the RNG state of ``device``.
 
-    The CUDA RNG state is a 16-byte uint8 tensor laid out as
-    seed[0:8] + offset[8:16]. get_rng_state returns a CPU tensor, so the
-    uint64 fields are read with a direct view; the device argument is
-    forwarded so the state always matches the tensors under test.
+    Only the 16-byte layout shared by cuda and xpu (seed[0:8] + offset[8:16])
+    is decoded here; other backends use a different size and are rejected
+    below instead of being read with the wrong field offsets.
     """
     st = torch.get_device_module(device).get_rng_state(device)
+    if st.numel() != 16:
+        raise AssertionError(f"{device} RNG state is {st.numel()} bytes, not 16")
     seed = st[:8].view(torch.int64).item()
     off = st[8:16].view(torch.int64).item()
     return seed, off
@@ -218,15 +220,18 @@ class TestDropoutAlignRandomEager(InductorTestCase):
 
     @skipXPUIf(True, "intel/torch-xpu-ops/issue/4851")
     def test_dropout_mask_parity_and_rng_offset(self, device):
-        H, W = BATCH * SEQ_LEN, FFN_DIM
+        props = torch.get_device_module(device).get_device_properties(device)
+        threads = props.multi_processor_count * props.max_threads_per_multi_processor
+        # 4 * threads elements is where fp16/bf16 (VEC=8) need more offset than fp32 (VEC=4).
+        shapes = [(BATCH * SEQ_LEN, FFN_DIM), (4 * threads,)]
 
         dev_mod = torch.get_device_module(device)
         dtypes = [torch.float32, torch.float16, torch.bfloat16]
-        for dtype in dtypes:
+        for shape, dtype in itertools.product(shapes, dtypes):
             if dtype is torch.bfloat16 and not dev_mod.is_bf16_supported():
                 continue
 
-            x = torch.ones((H, W), device=device, dtype=dtype)
+            x = torch.ones(shape, device=device, dtype=dtype)
 
             # Eager
             _set_seed(BASE_SEED)
