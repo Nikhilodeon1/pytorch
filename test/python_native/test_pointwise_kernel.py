@@ -25,6 +25,17 @@ from torch.testing._internal.common_utils import (
 class TestPointwiseIndexing(TestCase):
     hw_classification = HardwareClassification.GENERIC
 
+    def test_row_first_grid_limit(self) -> None:
+        from torch._native.ops.pointwise.layout import tma_layout
+
+        # FP32 transpose + bool output selects rows_first with 192-column groups.
+        # grid.y = 65536 exceeds CUDA's launch limit.
+        shape = (32, 192 * 65535 + 32)
+        layout = tma_layout(
+            ((torch.float32, shape, (1, 32)),), shape, torch.bool, (shape[1], 1)
+        )
+        self.assertIsNone(layout)
+
     @parametrize(
         "shape,strides,expected",
         (((2**31,), (1,), False), ((2,), (2**31,), False), ((8, 8), (16, 1), True)),
@@ -61,6 +72,7 @@ class TestPointwiseKernel(TestCase):
                 cutlass.Float32,
                 [x, y],
                 (torch.float16,),
+                load="direct",
             )
         self.assertEqual(actual, expected, atol=0, rtol=0)
 
@@ -105,6 +117,7 @@ class TestPointwiseKernel(TestCase):
                 torch2cute[dtype],
                 inputs,
                 (dtype,),
+                load="direct",
             )
             self.assertEqual(actual, expected)
 
@@ -133,6 +146,7 @@ class TestPointwiseKernel(TestCase):
                 cutlass.Float32,
                 [x],
                 (x.dtype,),
+                load="direct",
             )
             self.assertEqual(actual, x * 2)
 
@@ -163,6 +177,7 @@ class TestPointwiseKernel(TestCase):
                 None,
                 None,
                 None,
+                load=None,
                 out_refs=outputs,
             )
 
@@ -431,6 +446,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[compute],
             (value,),
             (compute,),
+            load="direct",
             vec_bits=vec_bits,
         )
         with torch.backends.python_native.cutedsl.disabled():
@@ -470,6 +486,7 @@ class TestPointwiseKernel(TestCase):
                 torch2cute[compute],
                 [x],
                 (dtype,),
+                load="direct",
             )
             self.assertEqual(actual.dtype, dtype)
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -514,6 +531,7 @@ class TestPointwiseKernel(TestCase):
                         (x.dtype,),
                         out=[out],
                         work_per_thread=work_per_thread,
+                        load="direct",
                     )
                     self.assertIs(actual, out)
                     self.assertEqual(out.stride(), strides)
@@ -550,6 +568,7 @@ class TestPointwiseKernel(TestCase):
             ct,
             [x, scalar],
             (x.dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -693,6 +712,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[a.dtype],
             [a, b],
             (a.dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -734,6 +754,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[dtype],
             [x, y],
             (dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected)
@@ -753,6 +774,7 @@ class TestPointwiseKernel(TestCase):
             "cpu_rank",
             "casts",
             "results",
+            "load",
         ),
     )
     def test_engine_rejects_invalid_operands_outputs(
@@ -788,6 +810,8 @@ class TestPointwiseKernel(TestCase):
             kwargs, message = {"input_casts": ()}, "input cast count"
         elif case == "results":
             kwargs, message = {"result_dtypes": ()}, "result dtype count"
+        elif case == "load":
+            kwargs, message = {"load": "TMA"}, "load mode"
         with self.assertRaisesRegex(ValueError, message):
             kernel.run(
                 ops.get_fn("_identity"),
