@@ -448,7 +448,9 @@ def _recursive_record_original_output_strides(gm: GraphModule) -> None:
     for node in gm.graph.find_nodes(
         op="call_function", target=torch.ops.higher_order.invoke_subgraph
     ):
-        subgraph = getattr(gm, node.args[0].target)
+        # target is a qualified path (nested regions register subgraphs inside
+        # subgraphs), so it can contain dots that a flat getattr cannot walk.
+        subgraph = gm.get_submodule(node.args[0].target)
         _recursive_record_original_output_strides(subgraph)
 
     record_original_output_strides(gm)
@@ -459,7 +461,9 @@ def _recursive_record_user_visible_output_idxs(gm: GraphModule) -> None:
     for node in gm.graph.find_nodes(
         op="call_function", target=torch.ops.higher_order.invoke_subgraph
     ):
-        subgraph = getattr(gm, node.args[0].target)
+        # target is a qualified path (nested regions register subgraphs inside
+        # subgraphs), so it can contain dots that a flat getattr cannot walk.
+        subgraph = gm.get_submodule(node.args[0].target)
 
         for node in subgraph.graph.find_nodes(op="output"):
             node.meta["user_visible_output_idxs"] = [
