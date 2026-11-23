@@ -22,7 +22,11 @@ from torch._inductor.runtime.hints import (
     TRITON_MAX_BLOCK,
     TRITON_MAX_MIX_ORDER_XBLOCK,
 )
-from torch._inductor.runtime.runtime_utils import last_power_of_2, next_power_of_2
+from torch._inductor.runtime.runtime_utils import (
+    ceildiv,
+    last_power_of_2,
+    next_power_of_2,
+)
 from torch._inductor.runtime.tiling import (
     get_max_block,
     get_pointwise_prefixes,
@@ -33,7 +37,18 @@ from torch.utils._ordered_set import OrderedSet
 
 
 if TYPE_CHECKING:
+    from torch._inductor.runtime.hints import DeviceProperties
     from torch._inductor.runtime.triton_compat import Config
+
+
+# On sm_107, ptxas stops auto-unrolling a reduction loop with a masked tail
+# past a toolchain-dependent trip count (~15-20 iterations with Triton 3.9 and
+# ptxas 13.5, ~44 with older ones), leaving one load in flight per warp and
+# cutting bandwidth ~3.5x. Requesting the unroll restores it; factor 4 is
+# neutral for short loops and helps from ~10 iterations. 2 was too low for the
+# longest loops and 8 was no better than 4.
+_SM107_UNROLL_MIN_ITERATIONS = 8
+_SM107_LOOP_UNROLL_FACTOR = 4
 
 
 # ------------------------------------------------------------------
@@ -246,7 +261,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             "autotune_hints", ()
         )
         MAX_R0_BLOCK = self._max_r0_block(device_major)
-        if size_hints["x"] >= 1024 and loads_and_red >= 10:
+        if self._is_register_intensive(size_hints["x"], loads_and_red):
             MAX_R0_BLOCK = 1024
             register_intensive = True
 
@@ -568,6 +583,44 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                     c.kwargs.pop(f"{p.upper()}BLOCK")  # type: ignore[union-attr]
 
         return configs
+
+    def get_loop_unroll_factor(
+        self,
+        *,
+        rnumel: int,
+        reduction_hint: ReductionHint,
+        size_hint_x: int,
+        loads_and_red: int,
+        scalar_accumulators: bool,
+        device: DeviceProperties,
+    ) -> int | None:
+        """Explicit ``loop_unroll_factor`` for a looped reduction's ``tl.range``.
+
+        Called by Triton codegen for the reduction loop of a single-loop,
+        non-persistent reduction kernel with a static reduction size.
+        Returns None to leave unrolling to the backend compiler.
+        """
+        if (
+            device.type != "cuda"
+            or device.cc != 107
+            or reduction_hint != ReductionHint.INNER
+            # Unmeasured: get_configs gives them R0_BLOCKs of 4096-16384.
+            or scalar_accumulators
+            # Unmeasured: more loads in flight add to their register pressure.
+            or self._is_register_intensive(size_hint_x, loads_and_red)
+        ):
+            return None
+        # Iterations of the largest R0_BLOCK get_configs picks; ptxas still
+        # unrolls the loop when rnumel is a multiple of it (no masked tail).
+        r0_block = self._max_r0_block(device.major)
+        iterations = ceildiv(rnumel, r0_block)
+        if rnumel % r0_block == 0 or iterations <= _SM107_UNROLL_MIN_ITERATIONS:
+            return None
+        return _SM107_LOOP_UNROLL_FACTOR
+
+    @staticmethod
+    def _is_register_intensive(size_hint_x: int, loads_and_red: int) -> bool:
+        return size_hint_x >= 1024 and loads_and_red >= 10
 
     # ------------------------------------------------------------------
     # Hook methods for device-specific overrides
