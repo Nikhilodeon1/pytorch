@@ -14457,6 +14457,43 @@ class TestRNNMPS(TestCaseMPS):
         self.assertRaises(Exception, lambda: lstm(input, (cx, hx)))
 
 
+class TestMPPAvailability(TestCase):
+    def _is_mpp_available_in_subprocess(self, env_overrides):
+        # PYTORCH_MPS_METAL_VERSION is read once per process, so the
+        # override must be exercised in a fresh subprocess.
+        env = os.environ.copy()
+        env.update(env_overrides)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import torch.backends.mps; print(torch.backends.mps.is_mpp_available())",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=os.path.dirname(os.path.realpath(__file__)),
+        )
+        return result.stdout.strip()
+
+    @unittest.skipUnless(
+        torch.backends.mps.is_available()
+        and torch.backends.mps.is_macos_or_newer(26, 2)
+        and re.match(r"Apple M[1-9]", torch.backends.mps.get_name()) is not None
+        and os.environ.get("PYTORCH_MPS_METAL_VERSION") not in ("3.1", "3.2"),
+        "MetalPerformancePrimitives requires macOS 26.2+, an Apple7+ GPU, and Metal 4.0",
+    )
+    def test_is_mpp_available_true_when_supported(self):
+        self.assertEqual(self._is_mpp_available_in_subprocess({}), "True")
+
+    def test_is_mpp_available_false_with_metal_3_2(self):
+        self.assertEqual(
+            self._is_mpp_available_in_subprocess({"PYTORCH_MPS_METAL_VERSION": "3.2"}),
+            "False",
+        )
+
+
 class TestFallbackWarning(TestCase):
     # TODO: Remove once test_testing.py is running on MPS devices
     def test_no_warning_on_import(self):
