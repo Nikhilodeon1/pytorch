@@ -141,8 +141,8 @@ def fully_shard(
     parameters and later free parameters and reduce-scatter gradients.
 
     Parameter dtypes and ``grad_dtype`` may change (e.g. ``module.bfloat16()``)
-    until lazy initialization at the first forward or
-    :meth:`FSDPModule.unshard`; later changes are unsupported. An explicit
+    until lazy initialization at the first forward, :meth:`FSDPModule.lazy_init`,
+    or :meth:`FSDPModule.unshard`; later changes are unsupported. An explicit
     ``grad_dtype`` survives dtype conversions and is inherited by a parameter
     that ``load_state_dict(assign=True)`` registers without one. Device moves
     preserve sharded gradient dtypes and leave pending gradients on their
@@ -435,6 +435,36 @@ class FSDPModule:
             return handle
         handle.wait()
         return None
+
+    @_dynamo_disable
+    def lazy_init(self) -> None:
+        """
+        Initializes this module as the root FSDP module and all nested FSDP
+        submodules under it as non-root modules.
+
+        Normally, FSDP performs lazy initialization on the first forward pass
+        of the root module. Call this method explicitly on the root module
+        after all :func:`fully_shard` calls have completed when submodules may
+        run forward before or without the root module (for example, evaluating
+        an encoder submodule first, or calling grouped embeddings and decoder
+        layers separately from an inference engine), or when accessing
+        resources created at lazy initialization (such as
+        :meth:`get_all_gather_copy_in_stream` or :func:`share_comm_ctx`).
+
+        Calling this method repeatedly on an already-initialized root module
+        is a no-op.
+
+        Raises:
+            RuntimeError: If called on a module that is already initialized as
+                a non-root module, on a multi-module ``fully_shard`` group, or
+                if a nested submodule has already been lazily initialized.
+        """
+        state = self._get_fsdp_state()
+        if state._is_root is False:
+            raise RuntimeError(
+                f"lazy_init must be called on the root {state._state_name} module"
+            )
+        state._lazy_init()
 
     @_dynamo_disable
     def reset_iter_state(self) -> None:
@@ -1220,7 +1250,8 @@ class FSDPModule:
         and this stream carries none of them.
 
         The stream is shared by the FSDP modules under one root, and created
-        at lazy initialization, in the root module's first forward.
+        at lazy initialization, in the root module's first forward or
+        :meth:`lazy_init`.
 
         Raises:
             RuntimeError: If called before lazy initialization.
@@ -1229,7 +1260,8 @@ class FSDPModule:
         if state._is_root is None:
             raise RuntimeError(
                 "The all-gather copy-in stream is created at lazy initialization. "
-                "Call this after the root FSDP module's first forward."
+                "Call this after the root FSDP module's first forward or after "
+                "calling lazy_init() on the root module."
             )
         return state._comm_ctx.all_gather_copy_in_stream
 
