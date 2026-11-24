@@ -5,9 +5,12 @@ import warnings
 from typing import Any, TYPE_CHECKING
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from .._core import ComplexTensor
 from .common import (
+    _as_complex_tensor,
+    _as_interleaved,
     _get_func_name,
     COMPLEX_TO_REAL,
     complex_to_real_dtype,
@@ -17,6 +20,7 @@ from .common import (
     REAL_TO_COMPLEX,
     register_binary_nonlinear,
     register_complex,
+    register_complex_function,
     register_error,
     register_force_test,
     register_inductor,
@@ -29,6 +33,8 @@ from .common import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from torch.autograd.function import FunctionCtx
 
 
 aten = torch.ops.aten
@@ -64,8 +70,12 @@ def register_binary_linear_inplace(
     op: OpType, out_of_place_impl: Callable[..., Any]
 ) -> Callable[..., Any]:
     def impl(
-        lhs: ComplexTensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
-    ) -> ComplexTensor:
+        lhs: ComplexTensor | torch.Tensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
+    ) -> ComplexTensor | torch.Tensor:
+        if not lhs.dtype.is_complex:
+            raise RuntimeError(
+                f"result type {torch.result_type(lhs, rhs)} can't be cast to the desired output type {lhs.dtype}"
+            )
         result = out_of_place_impl(lhs, rhs, *args, **kwargs)
         lhs.copy_(result)
         return lhs
@@ -258,6 +268,7 @@ INDUCTOR_OPS = [
     aten.linalg_qr,
     aten.linalg_solve_triangular,
     aten.linalg_vector_norm,
+    aten.lu_unpack,
 ]
 
 for inductor_op in INDUCTOR_OPS:
@@ -340,6 +351,53 @@ def div_impl(
         (num_r / den).to(out_dt),
         (num_i / den).to(out_dt),
     )
+
+
+div__impl = register_binary_linear_inplace(aten.div_, div_impl)
+
+
+@register_complex(aten.tril_)
+def tril__impl(self: ComplexTensor, diagonal: int = 0) -> ComplexTensor:
+    self.re.tril_(diagonal)
+    self.im.tril_(diagonal)
+    return self
+
+
+# The native backward writes in place through views of intermediates, which don't alias
+# for `ComplexTensor`, so run it on interleaved tensors instead.
+class HouseholderProduct(torch.autograd.Function):
+    @staticmethod
+    def forward(  # type: ignore[bad-override]
+        ctx: FunctionCtx, input: ComplexTensor, tau: ComplexTensor
+    ) -> ComplexTensor:
+        ctx.save_for_backward(input, tau)
+        with torch._C.DisableTorchFunctionSubclass():
+            return torch.linalg.householder_product(input, tau)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad: ComplexTensor) -> tuple[Any, ...]:  # type: ignore[bad-override]
+        inputs = ctx.saved_tensors
+        with torch.enable_grad():
+            args = [_as_interleaved(t).detach().requires_grad_() for t in inputs]
+            out = torch.linalg.householder_product(*args)
+            grads = torch.autograd.grad(out, args, _as_interleaved(grad))
+        return tuple(
+            _as_complex_tensor(g) if isinstance(t, ComplexTensor) else g
+            for g, t in zip(grads, inputs, strict=True)
+        )
+
+
+@register_complex_function(
+    torch.linalg.householder_product, torch.orgqr, torch.Tensor.orgqr
+)
+def householder_product_function(
+    input: torch.Tensor, tau: torch.Tensor, *, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    if out is not None:
+        with torch._C.DisableTorchFunctionSubclass():
+            return torch.linalg.householder_product(input, tau, out=out)
+    return HouseholderProduct.apply(input, tau)
 
 
 @register_complex(aten.reciprocal)
