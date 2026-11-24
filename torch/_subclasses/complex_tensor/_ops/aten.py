@@ -7,7 +7,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 from torch.autograd.function import once_differentiable
 
-from .._core import ComplexTensor
+from .._core import ComplexTensor, InterleavedComplexTensor
 from .common import (
     _as_complex_tensor,
     _as_interleaved,
@@ -15,6 +15,7 @@ from .common import (
     COMPLEX_TO_REAL,
     complex_to_real_dtype,
     is_complex,
+    is_complex_tensor,
     OpType,
     promote_tensors,
     REAL_TO_COMPLEX,
@@ -129,7 +130,9 @@ for simple_op in SIMPLE_OPS_LIST:
     globals()[_get_func_name(simple_op)] = register_simple(simple_op)
 
 
-def _set_wrapper_metadata(self: ComplexTensor, like: torch.Tensor) -> None:
+def _set_wrapper_metadata(
+    self: ComplexTensor | InterleavedComplexTensor, like: torch.Tensor
+) -> None:
     # Autograd returns `self` for in-place ops, so its sizes/strides must match `like`'s.
     # The wrapper's storage is synthetic, so use the meta `set_`, which grows it as needed.
     python_key = torch._C.DispatchKeySet(torch._C.DispatchKey.Python)
@@ -182,10 +185,17 @@ del inplace_view_op
 
 @register_complex(aten.resize_)
 def resize__impl(
-    self: ComplexTensor,
+    self: ComplexTensor | InterleavedComplexTensor,
     size: list[int],
     memory_format: torch.memory_format | None = None,
-) -> ComplexTensor:
+) -> ComplexTensor | InterleavedComplexTensor:
+    if isinstance(self, InterleavedComplexTensor):
+        data = torch.view_as_complex(self._data)
+        data.resize_(size, memory_format=memory_format)
+        self._data = torch.view_as_real(data)
+        _set_wrapper_metadata(self, data)
+        return self
+
     # E.g. `from_interleaved` of an empty tensor leaves both components viewing one
     # storage, so they would overlap once resized.
     if self._re.untyped_storage()._cdata == self._im.untyped_storage()._cdata:
@@ -200,7 +210,6 @@ def resize__impl(
 # TODO (hameerabbasi): Not being tested
 SIMPLE_FORCE_TESTED_OPS = [
     aten.col2im,
-    aten.alias,
     aten.lift_fresh,
     aten._unsafe_view,
     aten.index,
@@ -383,7 +392,9 @@ class HouseholderProduct(torch.autograd.Function):
             out = torch.linalg.householder_product(*args)
             grads = torch.autograd.grad(out, args, _as_interleaved(grad))
         return tuple(
-            _as_complex_tensor(g) if isinstance(t, ComplexTensor) else g
+            _as_complex_tensor(g, isinstance(t, InterleavedComplexTensor))
+            if is_complex_tensor(t)
+            else g
             for g, t in zip(grads, inputs, strict=True)
         )
 
@@ -409,6 +420,19 @@ def reciprocal_impl(self: ComplexTensor) -> ComplexTensor:
         aten.div(self_r, den).to(out_dt),
         aten.div(-self_i, den).to(out_dt),
     )
+
+
+@register_complex(aten.alias)
+def alias_impl(
+    self: ComplexTensor | InterleavedComplexTensor,
+) -> ComplexTensor | InterleavedComplexTensor:
+    if isinstance(self, InterleavedComplexTensor):
+        out = InterleavedComplexTensor(self._data)
+        torch._C._set_neg(out, self.is_neg())
+        torch._C._set_conj(out, self.is_conj())
+        return out
+
+    return ComplexTensor(aten.alias(self.re), aten.alias(self.im))
 
 
 # reductions
@@ -489,7 +513,7 @@ def angle_impl(self: ComplexTensor) -> torch.Tensor:
 def acos_impl(self: ComplexTensor) -> ComplexTensor:
     _, y = split_complex_tensor(self)
     acosh_z = torch.acosh(self)
-    if not isinstance(acosh_z, ComplexTensor):
+    if not is_complex_tensor(acosh_z):
         raise AssertionError(f"acosh_z must be a ComplexTensor, got {type(acosh_z)}")
     acosh_z_re, acosh_z_im = split_complex_tensor(acosh_z)
     sign_im = 2 * torch.signbit(y) - 1
@@ -500,7 +524,7 @@ def acos_impl(self: ComplexTensor) -> ComplexTensor:
 def asin_impl(self: ComplexTensor) -> ComplexTensor:
     x, y = split_complex_tensor(self)
     asinh_iz = torch.asinh(ComplexTensor(-y, x))
-    if not isinstance(asinh_iz, ComplexTensor):
+    if not is_complex_tensor(asinh_iz):
         raise AssertionError(f"asinh_iz must be a ComplexTensor, got {type(asinh_iz)}")
     asinh_iz_re, asinh_iz_im = split_complex_tensor(asinh_iz)
     return ComplexTensor(asinh_iz_im, -asinh_iz_re)
@@ -510,7 +534,7 @@ def asin_impl(self: ComplexTensor) -> ComplexTensor:
 def atan_impl(self: ComplexTensor) -> ComplexTensor:
     x, y = split_complex_tensor(self)
     tanh_iz = torch.atanh(ComplexTensor(-y, x))
-    if not isinstance(tanh_iz, ComplexTensor):
+    if not is_complex_tensor(tanh_iz):
         raise AssertionError(f"tanh_iz must be a ComplexTensor, got {type(tanh_iz)}")
     tanh_iz_re, tanh_iz_im = split_complex_tensor(tanh_iz)
     return ComplexTensor(tanh_iz_im, -tanh_iz_re)
@@ -536,7 +560,7 @@ def atanh_impl(self: ComplexTensor) -> ComplexTensor:
     ret = 0.5 * (
         torch.log(ComplexTensor(1 + x, y)) - torch.log(ComplexTensor(1 - x, -y))
     )
-    if not isinstance(ret, ComplexTensor):
+    if not is_complex_tensor(ret):
         raise AssertionError(f"ret must be a ComplexTensor, got {type(ret)}")
     ret_re, ret_im = split_complex_tensor(ret)
 
@@ -562,7 +586,7 @@ def cosh_impl(self: ComplexTensor) -> ComplexTensor:
 def sin_impl(self: ComplexTensor) -> ComplexTensor:
     x, y = split_complex_tensor(self)
     sinh_iz = torch.sinh(ComplexTensor(-y, x))
-    if not isinstance(sinh_iz, ComplexTensor):
+    if not is_complex_tensor(sinh_iz):
         raise AssertionError(f"sinh_iz must be a ComplexTensor, got {type(sinh_iz)}")
     sinh_iz_re, sinh_iz_im = split_complex_tensor(sinh_iz)
     return ComplexTensor(sinh_iz_im, -sinh_iz_re)
@@ -581,7 +605,7 @@ def sinh_impl(self: ComplexTensor) -> ComplexTensor:
 def tan_impl(self: ComplexTensor) -> ComplexTensor:
     x, y = split_complex_tensor(self)
     tanh_iz = torch.tanh(ComplexTensor(-y, x))
-    if not isinstance(tanh_iz, ComplexTensor):
+    if not is_complex_tensor(tanh_iz):
         raise AssertionError(f"tanh_iz must be a ComplexTensor, got {type(tanh_iz)}")
     tanh_iz_re, tanh_iz_im = split_complex_tensor(tanh_iz)
     return ComplexTensor(tanh_iz_im, -tanh_iz_re)
@@ -980,7 +1004,7 @@ def addmm_impl(
     alpha: int | float | complex = 1,
 ) -> ComplexTensor:
     ret = beta * input + alpha * torch.mm(mat1, mat2)
-    if not isinstance(ret, ComplexTensor):
+    if not is_complex_tensor(ret):
         raise AssertionError(f"ret must be a ComplexTensor, got {type(ret)}")
     ret_r, ret_i = split_complex_tensor(ret)
     if out_dtype is not None:
@@ -1426,13 +1450,36 @@ def _to_copy_out(
 
 @register_complex(aten.view.dtype)
 def view_dtype_impl(
-    self: ComplexTensor,
+    self: ComplexTensor | InterleavedComplexTensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if dtype != self.dtype:
+    if not isinstance(self, InterleavedComplexTensor) and dtype != self.dtype:
         raise RuntimeError(
             "Cannot view a non-interleaved complex tensor as a different dtype; use view_copy instead."
         )
+
+    if not dtype.is_complex:
+        if self.is_conj():
+            raise RuntimeError("Cannot take a real view of conjugated tensor.")
+        if isinstance(self, ComplexTensor):
+            raise AssertionError("Unreachable due to condition above.")
+        data = self._data.view(dtype).reshape(self.shape[:-1] + (-1,))
+        if self.is_neg():
+            data = aten._neg_view(data)
+        return data
+
+    real_dtype = COMPLEX_TO_REAL[dtype]
+    if isinstance(self, InterleavedComplexTensor):
+        out_shape = self._data.shape[:-2] + (-1, 2)
+        out_data = self._data.view(real_dtype).reshape(out_shape)
+        out = InterleavedComplexTensor(torch.view_as_complex(out_data))
+        if self.is_neg():
+            out = torch._neg_view(out)
+
+        if self.is_conj():
+            out = torch.conj(out)
+
+        return out
 
     re, im = split_complex_arg(self)
     return ComplexTensor(re.view(dtype=re.dtype), im.view(dtype=im.dtype))
@@ -1440,9 +1487,20 @@ def view_dtype_impl(
 
 @register_complex(aten.view.default)
 def view_default_impl(
-    self: ComplexTensor,
+    self: ComplexTensor | InterleavedComplexTensor,
     shape: tuple[int, ...],
 ) -> torch.Tensor:
+    if isinstance(self, InterleavedComplexTensor):
+        out_data = self._data.reshape(shape)
+        out = InterleavedComplexTensor(torch.view_as_complex(out_data))
+        if self.is_neg():
+            out = torch._neg_view(out)
+
+        if self.is_conj():
+            out = torch.conj(out)
+
+        return out
+
     re, im = split_complex_arg(self)
     return ComplexTensor(
         re.view(shape),
