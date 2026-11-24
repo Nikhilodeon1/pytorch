@@ -7,6 +7,7 @@ high-performance GEMM kernels for NVIDIA GPUs.
 """
 
 import itertools
+import math
 import re
 from enum import auto, Enum
 from typing import Any, Literal
@@ -509,19 +510,9 @@ class NVUniversalGemmCaller(ChoiceCaller):
 
     @staticmethod
     def _tensor_constraint_checks(size, stride, constraint, dtype, offset):
-        expected = constraint.stride
         rank = len(stride)
-        if (
-            expected is None
-            or rank == 0
-            or len(size) != rank
-            or len(expected) not in (rank, rank + 1)
-        ):
+        if rank == 0 or len(size) != rank:
             raise ValueError("NVGEMM operand constraint has incompatible rank")
-        expected = expected[-rank:]
-        if 1 not in expected:
-            raise ValueError("NVGEMM operand constraint has no contiguous mode")
-        major = expected.index(1)
         yield (
             sympy.Eq(
                 sympy.Mod(
@@ -531,8 +522,31 @@ class NVUniversalGemmCaller(ChoiceCaller):
             ),
             "NVGEMM operand pointer violates alignment",
         )
-        yield sympy.Eq(stride[major], 1), "NVGEMM operand is not contiguous"
+        expected = constraint.stride
         divisor = constraint.divisibility
+        if dtype == torch.float4_e2m1fn_x2:
+            divisor //= math.gcd(divisor, 2)
+        if expected is None:
+            for dim, step in enumerate(stride):
+                yield (
+                    sympy.Or(
+                        sympy.Eq(size[dim], 1),
+                        sympy.Eq(step, math.prod(size[dim + 1 :])),
+                    ),
+                    "NVGEMM scale operand is not contiguous",
+                )
+            yield (
+                sympy.Eq(sympy.Mod(math.prod(size), divisor), 0),
+                "NVGEMM scale element count violates alignment",
+            )
+            return
+        if len(expected) not in (rank, rank + 1):
+            raise ValueError("NVGEMM operand constraint has incompatible rank")
+        expected = expected[-rank:]
+        if 1 not in expected:
+            raise ValueError("NVGEMM operand constraint has no contiguous mode")
+        major = expected.index(1)
+        yield sympy.Eq(stride[major], 1), "NVGEMM operand is not contiguous"
         if divisor > 1:
             yield (
                 sympy.Eq(sympy.Mod(size[major], divisor), 0),
@@ -546,16 +560,39 @@ class NVUniversalGemmCaller(ChoiceCaller):
                     )
 
     def _operand_constraints(self):
-        if self.variant != GemmVariant.GEMM:
-            return
         operands = self.kernel.metadata.operands
-        a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
-        for node, constraint in (
-            (self.input_nodes[a_idx], operands.A),
-            (self.input_nodes[b_idx], operands.B),
-        ):
+        if self.variant == GemmVariant.GROUPED_GEMM:
+            nodes = [
+                (self.input_nodes[0], operands.A, False),
+                (self.input_nodes[1], operands.B, False),
+                (self.input_nodes[2], operands.offsets, False),
+            ]
+        else:
+            a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
+            scaled = self.variant == GemmVariant.SCALED_GEMM
+            nodes = [
+                (
+                    self.input_nodes[a_idx],
+                    operands.A.quantized if scaled else operands.A,
+                    self.swap_ab,
+                ),
+                (
+                    self.input_nodes[b_idx],
+                    operands.B.quantized if scaled else operands.B,
+                    self.swap_ab,
+                ),
+            ]
+            if scaled:
+                scale_a, scale_b = (3, 2) if self.swap_ab else (2, 3)
+                nodes.extend(
+                    [
+                        (self.input_nodes[scale_a], operands.A.scale, False),
+                        (self.input_nodes[scale_b], operands.B.scale, False),
+                    ]
+                )
+        for node, constraint, transpose in nodes:
             size, stride = list(node.get_size()), list(node.get_stride())
-            if self.swap_ab:
+            if transpose:
                 size[-2:] = reversed(size[-2:])
                 stride[-2:] = reversed(stride[-2:])
             yield size, stride, constraint, node.get_dtype(), node.get_layout().offset
@@ -583,27 +620,35 @@ class NVUniversalGemmCaller(ChoiceCaller):
         hints = sizevars.optimization_hints(symbols)
         return condition.xreplace(dict(zip(symbols, hints, strict=True))) is sympy.true
 
+    def _shape_constraint_checks(self):
+        for geometry in self._operand_constraints():
+            yield from self._tensor_constraint_checks(*geometry)
+        if self.variant == GemmVariant.SCALED_GEMM:
+            tile_n = self.kernel.metadata.design.tile_shape[1]
+            if tile_n < 64:
+                # Narrow block-scaled instructions cover a single N tile.
+                yield (
+                    sympy.Le(self._kernel_layout.size[-1], tile_n),
+                    "NVGEMM narrow kernel requires a single N tile",
+                )
+
     def _supports_current_shape_constraints(self) -> bool:
         try:
             return all(
                 self._shape_constraint_satisfied(condition)
-                for geometry in self._operand_constraints()
-                for condition, _ in self._tensor_constraint_checks(*geometry)
+                for condition, _ in self._shape_constraint_checks()
             )
         except ValueError:
             return False
 
     def _guard_dynamic_shape_constraints(self) -> None:
-        if self.variant != GemmVariant.GEMM:
-            return
         sizevars = V.graph.sizevars
-        for geometry in self._operand_constraints():
-            for condition, message in self._tensor_constraint_checks(*geometry):
-                if sizevars.shape_env.frozen:
-                    if not sizevars.statically_known_true(condition):
-                        raise AssertionError(message)
-                elif not sizevars.guard_or_false(condition):
+        for condition, message in self._shape_constraint_checks():
+            if sizevars.shape_env.frozen:
+                if not sizevars.statically_known_true(condition):
                     raise AssertionError(message)
+            elif not sizevars.guard_or_false(condition):
+                raise AssertionError(message)
 
     def output_node(self, *, install_guards: bool = True) -> TensorBox:
         from torch._inductor.ir import NVUniversalGemmBuffer
