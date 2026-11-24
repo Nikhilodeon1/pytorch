@@ -16,6 +16,15 @@ import torch.fx as fx
 # for some reason importing functional collectives after dynamo breaks collectives handling!
 from torch._C import FileCheck
 from torch._dynamo.utils import counters
+from torch._inductor.fx_passes import overlap_manual_scheduling, overlap_scheduling
+from torch._inductor.fx_passes.bucketing import (
+    _get_collective_node_from_wait,
+    _insert_fn_trace_before_node,
+)
+from torch._inductor.fx_passes.control_dependencies import get_mutation_dependencies
+from torch._inductor.fx_passes.overlap_preserving_bucketer import (
+    OverlapPreservingBucketer,
+)
 from torch._inductor.fx_passes.profile_guided_estimation import (
     ProfileData,
     ProfileGuidedEstimator,
@@ -97,6 +106,205 @@ def build_collective_info(graph, hiding_annotations):
         )
 
     return collective_info
+
+
+@unittest.skipUnless(dist.is_available(), "requires distributed")
+@instantiate_parametrized_tests
+class TestOverlapMutationOrdering(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def setUp(self):
+        super().setUp()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        dist.init_process_group(backend="fake", rank=0, world_size=2, store=FakeStore())
+        self.addCleanup(dist.destroy_process_group)
+        self.group_name = dist.distributed_c10d._get_default_group().group_name
+
+    @parametrize("manual", (False, True))
+    @parametrize("supplied", (False, True))
+    @parametrize("prioritize", (False, True))
+    def test_optional_mutation_deps_preserve_behavior(
+        self, manual, supplied, prioritize
+    ):
+        def fn(buffer, source):
+            start = torch.ops._c10d_functional.all_gather_into_tensor(
+                buffer, 2, self.group_name
+            )
+            wait = torch.ops._c10d_functional.wait_tensor(start)
+            buffer.copy_(source)
+            return wait, buffer
+
+        with FakeTensorMode():
+            gm = make_fx(fn)(torch.ones(4), torch.ones(4))
+        cls = (
+            overlap_manual_scheduling.ManualOverlapScheduler
+            if manual
+            else overlap_scheduling.OverlapScheduler
+        )
+        kwargs = {"mutation_deps": {} if supplied else None}
+        with (
+            torch._inductor.config.patch(
+                {"aten_distributed_optimizations.prioritize_fusion_regions": prioritize}
+            ),
+            patch.object(
+                overlap_scheduling, "get_mutation_dependencies", return_value=None
+            ) as collect,
+            patch.object(
+                cls, "_schedule", autospec=True, side_effect=cls._schedule
+            ) as schedule,
+            patch.object(overlap_scheduling.log, "warning") as warning,
+        ):
+            if manual:
+                result = overlap_manual_scheduling.manual_overlap_bucketing(
+                    gm, [], **kwargs
+                )
+            else:
+                result = overlap_scheduling.schedule_overlap_bucketing(
+                    gm,
+                    custom_runtime_estimation=lambda node, size: 1.0,
+                    prioritize_fusion_regions=prioritize,
+                    **kwargs,
+                )
+        self.assertIs(result, gm)
+        self.assertEqual(schedule.call_count, len(gm.graph.nodes))
+        self.assertEqual(collect.call_count, int(prioritize and not supplied))
+        self.assertEqual(warning.call_count, int(prioritize and not supplied))
+        self.assertIs(schedule.call_args.args[0].mutation_deps, kwargs["mutation_deps"])
+
+    @parametrize("supplied", (False, True))
+    def test_trace_missing_metadata_preserves_dependencies(self, supplied):
+        def fn(x):
+            return [x.sin(), x.cos()]
+
+        with FakeTensorMode():
+            gm = make_fx(fn)(torch.ones(4))
+        inp = next(iter(gm.graph.find_nodes(op="placeholder")))
+        outputs = next(iter(gm.graph.find_nodes(op="output"))).args[0]
+        deps = {outputs[0]: OrderedSet([inp])} if supplied else None
+        expected = {outputs[0]: OrderedSet([inp])} if supplied else None
+        with patch(
+            "torch._inductor.fx_passes.control_dependencies.get_mutation_dependencies",
+            return_value=None,
+        ) as collect:
+            _insert_fn_trace_before_node(
+                gm.graph,
+                fn,
+                (inp.meta["val"],),
+                outputs[0],
+                [inp],
+                outputs,
+                mutation_deps=deps,
+            )
+        self.assertEqual(collect.call_count, int(supplied))
+        self.assertEqual(deps, expected)
+        gm.graph.lint()
+
+    @parametrize("manual", (False, True))
+    @parametrize(
+        "kind",
+        ("all_gather", "reduce_scatter", "coalesced", "cast", "padded", "dependent"),
+    )
+    def test_bucket_mutation_dependencies(self, manual, kind):
+        c10d = torch.ops._c10d_functional
+
+        def pack(buffer):
+            if kind == "cast":
+                return buffer.to(torch.float64)
+            if kind == "padded":
+                a, b = buffer.view(-1).split(2)
+                return torch.cat([a, torch.nn.functional.pad(b, (0, 1))])
+            return buffer
+
+        def launch(buffer):
+            if kind in ("reduce_scatter", "coalesced", "padded"):
+                return c10d.reduce_scatter_tensor(buffer, "sum", 2, self.group_name)
+            return c10d.all_gather_into_tensor(buffer, 2, self.group_name)
+
+        def fn(buffer, other):
+            old = buffer.sin()
+            if kind == "dependent":
+                a = c10d.wait_tensor(launch(buffer))
+                buffer.copy_(buffer + 1)
+                b = c10d.wait_tensor(launch(buffer))
+            else:
+                if kind in ("cast", "padded"):
+                    before = pack(buffer)
+                    buffer.copy_(buffer + 1)
+                    after = pack(buffer)
+                else:
+                    buffer.view(-1).copy_(buffer + 1)
+                    before, after = buffer, other
+                a, b = launch(before), launch(after)
+                a, b = c10d.wait_tensor(a), c10d.wait_tensor(b)
+                if kind not in ("cast", "padded"):
+                    buffer.fill_(2)
+            return old, a, b, buffer
+
+        with FakeTensorMode():
+            size = 3 if kind == "padded" else 4
+            gm = make_fx(fn)(torch.ones(size), torch.ones(size))
+        writer = next(n for n in gm.graph.nodes if n.target is aten.copy_.default)
+        snapshot_op = aten._to_copy.default if kind == "cast" else aten.cat.default
+        snapshots = gm.graph.find_nodes(op="call_function", target=snapshot_op)
+        deps = get_mutation_dependencies(gm)
+        self.assertIsNotNone(deps)
+        waits = [n for n in gm.graph.nodes if n.target is c10d.wait_tensor.default]
+        info = {
+            w.args[0]: overlap_scheduling.CollectiveInfo(w.args[0], w, 0, 1.0, 1.0)
+            for w in waits
+        }
+        mode = (
+            "coalesced"
+            if kind == "coalesced"
+            else "custom_ops"
+            if kind in ("cast", "padded")
+            else "default"
+        )
+        cls = (
+            overlap_manual_scheduling.ManualOverlapPreservingBucketer
+            if manual
+            else OverlapPreservingBucketer
+        )
+        bucketer = cls(
+            gm.graph,
+            info,
+            OrderedSet(gm.graph.nodes),
+            mutation_deps=deps,
+            bucket_mode=mode,
+        )
+        if manual:
+            bucketer.manual_bucket_collectives(list(gm.graph.nodes))
+        else:
+            bucketer.bucket_collectives()
+        gm.graph.lint()
+        nodes = list(gm.graph.nodes)
+        waits = [n for n in nodes if n.target is c10d.wait_tensor.default]
+        self.assertEqual(len(waits), 2 if kind in ("dependent", "coalesced") else 1)
+        if kind == "dependent":
+            self.assertLess(nodes.index(waits[0]), nodes.index(writer))
+            self.assertLess(nodes.index(writer), nodes.index(waits[1].args[0]))
+        elif kind in ("cast", "padded"):
+            self.assertFalse(snapshots[0]._erased)
+            self.assertTrue(snapshots[1]._erased)
+            self.assertLess(nodes.index(snapshots[0]), nodes.index(writer))
+        else:
+            reader = (
+                _get_collective_node_from_wait(waits[0])
+                if kind == "coalesced"
+                else next(n for n in nodes if n.target is aten.cat.default)
+            )
+            overwrite = next(n for n in nodes if n.target is aten.fill_.Scalar)
+            self.assertLess(nodes.index(writer), nodes.index(reader))
+            self.assertLess(nodes.index(waits[0]), nodes.index(overwrite))
+        for node, dependencies in deps.items():
+            self.assertFalse(node._erased)
+            for dependency in dependencies:
+                self.assertFalse(dependency._erased)
+                self.assertLess(nodes.index(dependency), nodes.index(node))
+        self.assertFalse(
+            any(n.target is torch.ops.higher_order.control_deps for n in nodes)
+        )
 
 
 @requires_accelerator_dist_backend()

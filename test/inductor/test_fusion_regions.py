@@ -3,17 +3,244 @@
 """Tests for fusion region detection."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.fx as fx
+from torch._inductor import config
+from torch._inductor.compile_fx import compile_fx_inner
+from torch._inductor.fx_passes import fusion_regions
+from torch._inductor.fx_passes.control_dependencies import get_mutation_dependencies
+from torch._inductor.fx_passes.fusion_regions import (
+    build_fusion_regions,
+    contiguous_fusion_regions,
+    estimate_fused_node_costs,
+)
+from torch._inductor.fx_passes.overlap_scheduling import (
+    gather_node_runtime_estimations,
+    OverlapScheduler,
+)
+from torch._inductor.fx_utils import get_storage
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.ops import aten
-from torch.testing._internal.common_utils import xfailIfNoAcceleratorTriton
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    xfailIfNoAcceleratorTriton,
+)
 from torch.testing._internal.inductor_utils import GPU_TYPE
 
 
 HAS_GPU = torch.cuda.is_available() or torch.xpu.is_available()
+
+
+@instantiate_parametrized_tests
+class TestFusionCandidates(InductorTestCase):
+    def _make_graph(self, fn, *shapes):
+        with FakeTensorMode():
+            return make_fx(fn)(*(torch.ones(shape) for shape in shapes))
+
+    @parametrize(
+        "kind", ("mm", "bmm", "addmm", "baddbmm", "row_reduction", "horizontal")
+    )
+    @config.patch(prologue_fusion=True, epilogue_fusion=True)
+    def test_matmul_candidates(self, kind):
+        def fn(x, w, bias):
+            op = kind if kind in ("mm", "bmm", "addmm", "baddbmm") else "mm"
+            args = (x.sin(), w)
+            if kind in ("addmm", "baddbmm"):
+                args = (bias, *args)
+            result = getattr(torch, op)(*args)
+            if kind == "row_reduction":
+                return result.sum(-1).abs()
+            if kind == "horizontal":
+                result = result + x @ w
+            return result.relu()
+
+        prefix = (2,) if kind in ("bmm", "baddbmm") else ()
+        gm = self._make_graph(fn, (*prefix, 4, 8), (*prefix, 8, 4), (*prefix, 4, 4))
+        with config.patch(
+            {"triton.native_matmul": kind in ("row_reduction", "horizontal")}
+        ):
+            regions = build_fusion_regions(gm, prioritize=True)
+        calls = [n for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertTrue(all(regions[n] is regions[calls[0]] for n in calls))
+
+    @parametrize("kind", ("equal_numel", "shape", "metadata", "device", "fallback"))
+    def test_horizontal_domains(self, kind):
+        other = (4, 16) if kind == "shape" else (8, 4)
+        gm = self._make_graph(lambda x, y: (x.sin(), y.cos()), (4, 8), other)
+        calls = [n for n in gm.graph.nodes if n.op == "call_function"]
+        if kind == "metadata":
+            calls[1].meta.pop("val")
+        elif kind == "device":
+            calls[1].meta["val"] = torch.empty(other, device="meta")
+        elif kind == "fallback":
+            calls[1].meta["should_fallback"] = True
+        self.assertEqual(
+            bool(build_fusion_regions(gm, prioritize=True)), kind == "equal_numel"
+        )
+
+    def test_bounded_interleaved_regions(self):
+        gm = self._make_graph(lambda x: tuple(x.sin().cos() for _ in range(64)), (4,))
+        with config.patch(max_fusion_size=8):
+            regions = contiguous_fusion_regions(gm)
+        self.assertTrue(regions)
+        self.assertTrue(all(len(region) <= 8 for region in regions))
+        self.assertEqual(sum(map(len, regions)), 128)
+
+    @parametrize("prioritize", (False, True))
+    def test_gemm_costs_and_mutable_destination_writes(self, prioritize):
+        def fn(x, w, buffer):
+            old = buffer.sum()
+            result = (x.sin() @ w).relu()
+            buffer.copy_(torch.cat((result, result)))
+            return old, result, buffer
+
+        gm = self._make_graph(fn, (4, 8), (8, 4), (8, 4))
+        buffer = list(gm.graph.find_nodes(op="placeholder"))[-1]
+        writer = next(n for n in gm.graph.nodes if n.target is aten.copy_.default)
+        output = next(n for n in gm.graph.nodes if n.op == "output")
+        output.replace_input_with(writer, buffer)
+        self.assertIsNotNone(get_mutation_dependencies(gm))
+        cat = next(n for n in gm.graph.nodes if n.target is aten.cat.default)
+        compute = next(n for n in gm.graph.nodes if n.target is aten.mm.default)
+        regions = build_fusion_regions(gm, prioritize=prioritize)
+        self.assertIs(regions[cat], regions[writer])
+        outputs = []
+
+        def transfer(inputs, written):
+            outputs.extend(written)
+            return 1.0
+
+        with (
+            patch.object(
+                fusion_regions, "estimate_roofline_runtime_ms", return_value=17.0
+            ),
+            patch.object(fusion_regions, "get_transfer_time", side_effect=transfer),
+        ):
+            costs = estimate_fused_node_costs(regions, prioritize=prioritize)
+            custom = gather_node_runtime_estimations(
+                gm,
+                custom_runtime_estimation=lambda n, _: 42.0,
+                enable_fusion_regions=True,
+                prioritize_fusion_regions=prioritize,
+            )
+        if prioritize:
+            self.assertEqual(costs[compute], 17.0)
+        else:
+            self.assertNotIn(compute, costs)
+        self.assertEqual(costs[cat], 0.0)
+        self.assertGreater(costs[writer], 0.0)
+        self.assertEqual(
+            any(get_storage(t) == get_storage(buffer.meta["val"]) for t in outputs),
+            prioritize,
+        )
+        self.assertEqual(custom[cat], 42.0 if prioritize else 0.0)
+
+    @unittest.skipUnless(dist.is_available(), "requires distributed")
+    @parametrize("destination", ("input", "out"))
+    def test_collective_accesses_last_until_wait(self, destination):
+        graph = fx.Graph()
+        buffer, out, source = [
+            graph.placeholder(n) for n in ("buffer", "out", "source")
+        ]
+        with FakeTensorMode():
+            for node, size in zip(
+                (buffer, out, source), (4, 8, 4 if destination == "input" else 8)
+            ):
+                node.meta["val"] = torch.ones(size)
+        collective = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+            (buffer, 2, "group"),
+            {"out": out},
+        )
+        collective.meta["val"] = out.meta["val"]
+        wait = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default, (collective,)
+        )
+        wait.meta["val"] = out.meta["val"]
+        target = buffer if destination == "input" else out
+        writer = graph.call_function(aten.copy_.default, (target, source))
+        writer.meta["val"] = target.meta["val"]
+        graph.output((wait, writer))
+        gm = fx.GraphModule({}, graph)
+        self.assertIn(wait, (get_mutation_dependencies(gm) or {}).get(writer, ()))
+        source.meta.pop("val")
+        self.assertIsNone(get_mutation_dependencies(gm))
+
+
+class TestMutationDependencyLowering(InductorTestCase):
+    @parametrize("kind", ("copy", "out", "foreach", "materializing_view", "getitem"))
+    def test_reordered_mutations_compile(self, device, kind):
+        def fn(buffer, source):
+            alias = buffer.view(4, 4)
+            if kind == "materializing_view":
+                old = buffer.T.reshape(-1)
+            elif kind == "getitem":
+                old = buffer[[0, 1, 2, 3]]
+            else:
+                old = buffer.sin()
+            if kind == "out":
+                torch.add(source, source, out=alias)
+            elif kind == "foreach":
+                torch._foreach_copy_([alias], [source])
+            else:
+                alias.copy_(source)
+            middle = buffer.sum()
+            buffer.copy_(source + 1)
+            return old, middle, alias.sum(), buffer
+
+        with FakeTensorMode():
+            gm = make_fx(fn)(
+                torch.ones(4, 4, device=device), torch.ones(4, 4, device=device)
+            )
+        original_nodes = set(gm.graph.nodes)
+        with (
+            patch.object(
+                OverlapScheduler,
+                "_compute_off_path_score",
+                lambda self, n: -self.node_idx[n],
+            ),
+            patch.object(
+                OverlapScheduler,
+                "_align_compute_nodes_runtime_estimations_across_all_distributed_ranks",
+            ),
+        ):
+            OverlapScheduler(
+                gm,
+                max_in_flight_gb=1.0,
+                max_compute_pre_fetch=1,
+                collective_bucketing=False,
+                insert_overlap_deps=False,
+                compute_overlap_multipler=1.0,
+                max_coll_distance=1,
+                custom_runtime_estimation=lambda node, size: 1.0,
+                prioritize_fusion_regions=True,
+            ).run()
+        self.assertEqual(set(gm.graph.nodes), original_nodes)
+        gm.recompile()
+
+        buffer = torch.ones(4, 4, device=device)
+        source = torch.full((4, 4), 2.0, device=device)
+        expected = fn(buffer.clone(), source)
+        self.assertEqual(gm(buffer.clone(), source), expected)
+        if kind == "out":
+            actual = torch.compile(gm, fullgraph=True)(buffer.clone(), source)
+        else:
+            actual = compile_fx_inner(gm, [buffer, source], is_inference=True)(
+                [buffer.clone(), source]
+            )
+        self.assertEqual(actual, expected)
+
+
+instantiate_device_type_tests(
+    TestMutationDependencyLowering, globals(), only_for=("cpu", GPU_TYPE)
+)
 
 
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
@@ -172,10 +399,19 @@ class TestFusionRegionDetection(InductorTestCase):
         self.assertIsNotNone(add_node)
         self.assertTrue(is_fusible_node(add_node))
 
-        # aten.mm - has flop counter, should NOT be fusible
+        # aten.mm - requires enabled GEMM fusion support
         mm_node = find_node(aten.mm.default)
         self.assertIsNotNone(mm_node)
-        self.assertFalse(is_fusible_node(mm_node))
+        with config.patch(
+            {
+                "prologue_fusion": False,
+                "epilogue_fusion": False,
+                "triton.native_matmul": False,
+            }
+        ):
+            self.assertFalse(is_fusible_node(mm_node))
+        with config.patch(prologue_fusion=True):
+            self.assertTrue(is_fusible_node(mm_node))
 
         # aten.linalg_qr - fallback op, should NOT be fusible
         qr_node = find_node(aten.linalg_qr.default)
