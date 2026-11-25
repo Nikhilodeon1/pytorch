@@ -3458,10 +3458,10 @@ def use_decompose_k_choice(
         return False
     if sizevars.statically_known_true(large_k):
         return True
-    # A backed dynamic K (opt-in) uses splits that divide every K and is guarded
-    # on the threshold either way, so a K on the other side recompiles instead
-    # of reusing this graph. The threshold_multiple > 1 check only drops Triton
-    # mm; keep it for a dynamic K rather than add a second guard.
+    # A backed dynamic K (opt-in) is guarded on the threshold either way, so a
+    # K on the other side recompiles instead of reusing this graph. The
+    # threshold_multiple > 1 check only drops Triton mm; keep it for a dynamic K
+    # rather than add a second guard.
     if (
         not config.triton.decompose_k_dynamic_k
         or threshold_multiple != 1
@@ -3475,7 +3475,10 @@ def use_decompose_k_choice(
         sizevars.statically_known_true(sympy.Eq(sympy.Mod(k, s), 0))
         for s in get_k_splits(m, n, k)
     )
-    if not divisible:
+    # Without a dividing split, decomposeK runs the leftover K rows as an extra
+    # MM; on B200 that only beat mm from M * N * K ~ 2**33 (hints, no guard).
+    m_hint, n_hint, k_hint = (sizevars.optimization_hint(x) for x in (m, n, k))
+    if not (divisible or m_hint * n_hint * k_hint >= 2**33):
         return False
     return sizevars.guard_or_false(large_k)
 
