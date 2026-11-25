@@ -1530,6 +1530,31 @@ partitioned_scatter_force: bool = (
 )
 
 
+# Rewrite 2-D row scatter-adds (index_add, index_put accumulate, scatter_add with
+# a row-expanded index) on CUDA into kernel/skew_scatter.py: small destinations
+# privatize every row into fp32 copies; larger ones (fp32 outputs) take one kernel
+# autotuned on each call site's first call between Inductor's flat atomic scatter
+# and two hot-row kernels (the flat scatter is kept unless another is >= 10%
+# faster), once per process and never from the autotune caches (the best config
+# depends on the index values). Without a first call on real
+# data (AOT, cpp_wrapper, autotuning at compile time), sm80 takes the flat
+# scatter with one element per thread and sm90+ only small destinations. Only
+# scatters whose src and index are already materialized (graph input, extern
+# kernel or fallback output). Takes precedence over partitioned_scatter_enabled
+# for the scatters it rewrites; leaves to sorted_segment_scatter_enabled the
+# index_put nodes that pass rewrites.
+skew_scatter_enabled: bool = (
+    os.environ.get("TORCHINDUCTOR_SKEW_SCATTER_ENABLED", "0") == "1"
+)
+
+# Skip scatters with fewer index entries than this.
+skew_scatter_min_index_size: int = 1 << 16
+
+# Also rewrite embedding_dense_backward. Off by default: ATen's eager kernel is a
+# deterministic sorted reduce, and the atomic kernel's summation order differs.
+skew_scatter_embedding_backward: bool = False
+
+
 class _collective:
     auto_select: bool = False
     one_shot_all_reduce_threshold_bytes: int = 128 * 1024
