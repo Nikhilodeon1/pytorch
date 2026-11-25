@@ -86,7 +86,11 @@ from torch._inductor.select_algorithm import (
     TritonTemplateCaller,
 )
 from torch._prims_common import compute_required_storage_length
-from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8, SM90OrLater
+from torch.testing._internal.common_cuda import (
+    PLATFORM_SUPPORTS_FP8,
+    SM90OrLater,
+    tf32_off,
+)
 from torch.testing._internal.common_device_type import largeTensorTest
 from torch.testing._internal.common_utils import (
     _static_skip_if,
@@ -111,12 +115,7 @@ from torch.utils._triton import (
 aten = torch.ops.aten
 from torch._inductor.mock_cache import global_stats, PatchCaches, Stats
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import (
-    fresh_cache,
-    get_k_splits,
-    run_and_get_code,
-    use_decompose_k_choice,
-)
+from torch._inductor.utils import fresh_cache, get_k_splits, run_and_get_code
 from torch._inductor.virtualized import V
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing import FileCheck
@@ -2246,6 +2245,154 @@ class TestMaxAutotune(TestCase):
             bf16_red_setting
         )
 
+    def _compile_dynamic_k_mm(
+        self,
+        ks,
+        mn=(32, 64),
+        only_decompose_k=False,
+        k_multiple=256,
+        dynamic_k=True,
+        mark_range=None,
+    ):
+        """Run x.t() @ y with x: (K, M), y: (K, N) for each K, K dynamic from the
+        first call. K is passed as (K // k_multiple, k_multiple), so K =
+        k_multiple * s0. Returns the
+        frame count and the autotune choice names."""
+        M, N = mn
+        names: list[str] = []
+
+        def record(choices):
+            names.extend(c.name for c in choices)
+            if only_decompose_k:
+                return [
+                    c for c in choices if c.name.startswith("decompose_k")
+                ] or choices
+            return choices
+
+        torch._dynamo.reset()
+        cnt = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(
+            lambda x, y: x.reshape(-1, M).t() @ y.reshape(-1, N), backend=cnt
+        )
+        add_preprocessing_fn(record)
+        try:
+            with (
+                tf32_off(),
+                config.patch(
+                    {
+                        "max_autotune": True,
+                        "max_autotune_gemm_backends": "ATEN,TRITON",
+                        "test_configs.max_mm_configs": 1,
+                        "triton.num_decompose_k_splits": 4,
+                        "triton.decompose_k_dynamic_k": dynamic_k,
+                    }
+                ),
+            ):
+                for i, k in enumerate(ks):
+                    x = torch.randn(k // k_multiple, k_multiple, M, device=GPU_TYPE)
+                    y = torch.randn(k // k_multiple, k_multiple, N, device=GPU_TYPE)
+                    if i == 0:
+                        kw = {}
+                        if mark_range is not None:
+                            kw = {"min": mark_range[0], "max": mark_range[1]}
+                        torch._dynamo.mark_dynamic(x, 0, **kw)
+                        torch._dynamo.mark_dynamic(y, 0, **kw)
+                    out = compiled(x, y)
+                    ref = x.reshape(-1, M).t() @ y.reshape(-1, N)
+                    torch.testing.assert_close(
+                        out, ref, atol=1e-5 * ref.abs().max(), rtol=1e-5
+                    )
+        finally:
+            clear_preprocessing_fns(clear_defaults=False)
+        return cnt.frame_count, names
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k(self):
+        """A dynamic K = 256 * s0 gets decompose_k next to ATen mm, and one compile
+        serves every K, with decompose_k forced to win."""
+        frames, names = self._compile_dynamic_k_mm(
+            (16384, 20224, 24832, 32768), only_decompose_k=True
+        )
+        self.assertEqual(frames, 1)
+        self.assertTrue(any(n.startswith("decompose_k") for n in names), names)
+        self.assertIn("mm", names)
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k_recompiles_once_below_threshold(self):
+        """The only guard decompose_k adds is K >= threshold * max(M, N): a K
+        below it recompiles once, and further K on either side reuse the two
+        graphs. Here threshold * max(M, N) = 32 * 64 = 2048."""
+        frames, _ = self._compile_dynamic_k_mm((16384, 1024, 20224, 1280, 2048, 512))
+        self.assertEqual(frames, 2)
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k_needs_a_dividing_split(self):
+        """A dynamic K that no split is known to divide gets no decompose_k and
+        no guard."""
+        frames, names = self._compile_dynamic_k_mm((16391, 20011), k_multiple=1)
+        self.assertEqual(frames, 1)
+        self.assertFalse(any(n.startswith("decompose_k") for n in names), names)
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k_off_by_default(self):
+        """Without decompose_k_dynamic_k, a dynamic K gets no decompose_k and no
+        guard."""
+        frames, names = self._compile_dynamic_k_mm((16384, 1024), dynamic_k=False)
+        self.assertEqual(frames, 1)
+        self.assertFalse(any(n.startswith("decompose_k") for n in names), names)
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k_small_k_first(self):
+        """A first K below the threshold guards on it too, so a later large K
+        recompiles and gets decompose_k instead of reusing the small-K graph."""
+        frames, names = self._compile_dynamic_k_mm((1024, 16384))
+        self.assertEqual(frames, 2)
+        self.assertTrue(any(n.startswith("decompose_k") for n in names), names)
+
+    @unittest.skipIf(
+        config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
+    )
+    @unittest.skipIf(
+        config.triton.native_matmul,
+        "ignore decompose_k when native matmul codegen",
+    )
+    def test_decompose_k_dynamic_k_skips_user_range(self):
+        """A K with a declared mark_dynamic range is left alone, so the threshold
+        guard cannot narrow the range (ConstraintViolationError)."""
+        frames, names = self._compile_dynamic_k_mm((16384, 1024), mark_range=(2, 512))
+        self.assertEqual(frames, 1)
+        self.assertFalse(any(n.startswith("decompose_k") for n in names), names)
+
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -3213,7 +3360,6 @@ class TestMaxAutotune(TestCase):
         shapes = [(32, 32, 32768), (32, 32, 256)]
         for M, N, K in shapes:
             get_k_splits.cache_clear()
-            use_decompose_k_choice.cache_clear()
             a = torch.randn(M, K, dtype=torch.float16, device=GPU_TYPE)
             b = torch.randn(K, N, dtype=torch.float16, device=GPU_TYPE)
 
@@ -3442,7 +3588,6 @@ class TestMaxAutotune(TestCase):
 
         torch._dynamo.reset()
         get_k_splits.cache_clear()
-        use_decompose_k_choice.cache_clear()
         add_preprocessing_fn(record)
         try:
             with config.patch(
@@ -3456,7 +3601,6 @@ class TestMaxAutotune(TestCase):
         finally:
             clear_preprocessing_fns(clear_defaults=False)
             get_k_splits.cache_clear()
-            use_decompose_k_choice.cache_clear()
 
         self.assertEqual(actual, a @ b)
         self.assertTrue(any(name.startswith("triton_mm") for name in names), names)
@@ -3499,7 +3643,6 @@ class TestMaxAutotune(TestCase):
 
             torch._dynamo.reset()
             get_k_splits.cache_clear()
-            use_decompose_k_choice.cache_clear()
             add_preprocessing_fn(keep_decompose_k)
             try:
                 with config.patch(
@@ -3512,7 +3655,6 @@ class TestMaxAutotune(TestCase):
             finally:
                 clear_preprocessing_fns(clear_defaults=False)
                 get_k_splits.cache_clear()
-                use_decompose_k_choice.cache_clear()
             return out, names
 
         def within_tolerance(out):
