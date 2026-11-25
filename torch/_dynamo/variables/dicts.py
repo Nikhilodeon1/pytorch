@@ -779,7 +779,7 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
         from .iter import DictIterator
 
         ConstDictVariable.install_dict_order_guard(self, tx)
-        return DictIterator.create(self.items)
+        return DictIterator.create(self.items, owner=self)
 
     def tp_init_impl(
         self,
@@ -1270,7 +1270,7 @@ class OrderedDictVariable(ConstDictVariable):  # noqa: RVT001
         from .iter import DictIterator
 
         self.install_dict_order_guard(tx)
-        return DictIterator.create(self.items, ordered=True)
+        return DictIterator.create(self.items, ordered=True, owner=self)
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: VariableTracker, op: str
@@ -2011,9 +2011,7 @@ class DictViewVariable(VariableTracker):
         if self.is_ordered:
             from .iter import OrderedDictIterator
 
-            return OrderedDictIterator.create_reversed(
-                self.dv_dict.items, cast(str, self.kv)
-            )
+            return OrderedDictIterator.create_reversed(self)
         return variables.ListIteratorVariable(
             list(reversed(self.view_items_vt)),
             mutation_type=ValueMutationNew(),
@@ -2109,7 +2107,9 @@ class DictKeysVariable(DictViewVariable):
         from .iter import DictKeysIterator
 
         self.install_order_guard(tx)
-        return DictKeysIterator.create(self.dv_dict.items, ordered=self.is_ordered)
+        return DictKeysIterator.create(
+            self.dv_dict.items, ordered=self.is_ordered, owner=self
+        )
 
     def debug_repr(self) -> str:
         if not self.view_items:
@@ -2206,7 +2206,9 @@ class DictValuesVariable(DictViewVariable):
         from .iter import DictValuesIterator
 
         self.install_order_guard(tx)
-        return DictValuesIterator.create(self.dv_dict.items, ordered=self.is_ordered)
+        return DictValuesIterator.create(
+            self.dv_dict.items, ordered=self.is_ordered, owner=self
+        )
 
     def debug_repr(self) -> str:
         if not self.view_items:
@@ -2294,7 +2296,9 @@ class DictItemsVariable(DictViewVariable):
         from .iter import DictItemsIterator
 
         self.install_order_guard(tx)
-        return DictItemsIterator.create(self.dv_dict.items, ordered=self.is_ordered)
+        return DictItemsIterator.create(
+            self.dv_dict.items, ordered=self.is_ordered, owner=self
+        )
 
     tp_methods = {
         "isdisjoint": Method(DictViewVariable.isdisjoint),
